@@ -1,9 +1,10 @@
 
 import streamlit as st
-import pandas as pd
 from io import BytesIO
 from zipfile import ZipFile, ZIP_DEFLATED
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import pandas as pd
 import re
 
 st.set_page_config(
@@ -12,24 +13,24 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("MEP BOQ Automation")
-st.subheader("Client BOQ - System Wise Separation")
+st.title("MEP BOQ Automation System")
+st.subheader("Client BOQ to Separate System-wise Excel Files")
 
 SYSTEM_KEYWORDS = {
     "Fire Alarm System": [
         "fire alarm", "smoke detector", "heat detector",
         "mcp", "manual call point", "hooter", "sounder",
         "fire panel", "beam detector", "monitor module",
-        "control module", "telephone jack"
+        "control module", "telephone jack", "strobe"
     ],
     "Public Address System": [
         "public address", "pa system", "speaker",
         "amplifier", "microphone", "paviro",
-        "voice evacuation"
+        "voice evacuation", "ceiling speaker"
     ],
     "CCTV System": [
         "cctv", "camera", "nvr", "dvr",
-        "video surveillance"
+        "video surveillance", "ip camera"
     ],
     "Access Control System": [
         "access control", "card reader", "door controller",
@@ -41,11 +42,11 @@ SYSTEM_KEYWORDS = {
     ],
     "DALI Automation": [
         "dali", "dali gateway", "dali driver",
-        "dimming"
+        "dimming", "dali controller"
     ],
     "KNX Automation": [
         "knx", "knx gateway", "knx switch",
-        "knx sensor"
+        "knx sensor", "knx actuator"
     ],
     "Structured Cabling": [
         "structured cabling", "patch panel",
@@ -67,155 +68,215 @@ SYSTEM_KEYWORDS = {
     ]
 }
 
-SYSTEMS = list(SYSTEM_KEYWORDS.keys()) + ["Other ELV Systems", "Unassigned"]
+SYSTEMS = list(SYSTEM_KEYWORDS.keys()) + [
+    "Other ELV Systems",
+    "Unassigned"
+]
 
 
 def identify_system(description, part_code=""):
-    text = (str(description) + " " + str(part_code)).lower()
+    text = (
+        str(description) + " " + str(part_code)
+    ).lower()
 
     matches = []
 
     for system, keywords in SYSTEM_KEYWORDS.items():
-        if any(word in text for word in keywords):
-            matches.append(system)
+        for keyword in keywords:
+            if keyword in text:
+                matches.append(system)
+                break
 
     if len(matches) == 1:
         return matches[0]
 
+    # Ambiguous or unidentified items require manual review
     return "Unassigned"
 
 
-def excel_bytes(wb):
+def safe_filename(name):
+    return re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "_",
+        name
+    )
+
+
+def create_system_excel(original_bytes, sheet_name, header_row, selected_rows):
+    wb = load_workbook(BytesIO(original_bytes))
+    ws = wb[sheet_name]
+
+    # Remove all unrelated rows, from bottom to top
+    for row_num in range(ws.max_row, header_row, -1):
+        if row_num not in selected_rows:
+            ws.delete_rows(row_num, 1)
+
     output = BytesIO()
     wb.save(output)
     output.seek(0)
-    return output
+
+    return output.getvalue()
 
 
 st.header("1. Upload Client Blank BOQ")
 
 uploaded = st.file_uploader(
-    "Upload original Excel file (.xlsx)",
-    type=["xlsx"]
+    "Upload client Excel file",
+    type=["xlsx"],
+    help="Upload the original .xlsx BOQ file."
 )
 
 if uploaded:
 
     try:
-        file_content = uploaded.getvalue()
+        original_bytes = uploaded.getvalue()
 
-        wb_original = load_workbook(
-            BytesIO(file_content)
+        workbook = load_workbook(
+            BytesIO(original_bytes),
+            data_only=False
         )
 
         sheet_name = st.selectbox(
             "Select worksheet",
-            wb_original.sheetnames
+            workbook.sheetnames
         )
 
-        ws = wb_original[sheet_name]
+        ws = workbook[sheet_name]
 
-        # Read worksheet values
-        data = list(ws.values)
+        st.success("Excel file uploaded successfully!")
 
-        if not data:
-            st.error("Excel sheet is empty.")
-            st.stop()
+        st.write("Total rows:", ws.max_row)
+        st.write("Total columns:", ws.max_column)
+
+        st.header("2. Select Header Row")
 
         header_row = st.number_input(
-            "Header row number",
+            "Which row contains the column headings?",
             min_value=1,
-            max_value=ws.max_row,
-            value=1
+            max_value=max(1, ws.max_row),
+            value=1,
+            step=1
         )
 
-        headers = list(
-            ws.iter_rows(
-                min_row=int(header_row),
-                max_row=int(header_row),
-                values_only=True
-            )
-        )[0]
+        header_row = int(header_row)
 
-        headers = [
-            str(h) if h is not None else f"Column {i+1}"
-            for i, h in enumerate(headers)
-        ]
+        # Create unique column labels using actual Excel positions
+        column_options = {}
 
-        df = pd.read_excel(
-            BytesIO(file_content),
-            sheet_name=sheet_name,
-            header=int(header_row)-1,
-            engine="openpyxl"
+        for col_num in range(1, ws.max_column + 1):
+            value = ws.cell(
+                row=header_row,
+                column=col_num
+            ).value
+
+            if value is None or str(value).strip() == "":
+                value = "Unnamed"
+
+            letter = get_column_letter(col_num)
+
+            label = f"{letter} - {str(value).strip()}"
+
+            if label in column_options:
+                label += f" (Column {col_num})"
+
+            column_options[label] = col_num
+
+        if not column_options:
+            st.error("No columns found in selected header row.")
+            st.stop()
+
+        st.header("3. Select BOQ Columns")
+
+        description_label = st.selectbox(
+            "Select Description / Item Details column",
+            list(column_options.keys())
         )
 
-        st.success("Client BOQ uploaded successfully!")
-
-        st.write("Total Excel rows:", ws.max_row)
-        st.write("Total BOQ records:", len(df))
-
-        st.header("2. Select BOQ Columns")
-
-        description_col = st.selectbox(
-            "Select Item Description column",
-            headers
-        )
-
-        code_col = st.selectbox(
+        code_label = st.selectbox(
             "Select Part Code column (if available)",
-            ["None"] + headers
+            ["None"] + list(column_options.keys())
         )
 
-        if st.button("Identify Different Systems", type="primary"):
+        description_col = column_options[description_label]
 
-            suggestions = []
+        if code_label == "None":
+            code_col = None
+        else:
+            code_col = column_options[code_label]
 
-            for _, row in df.iterrows():
+        if st.button(
+            "Identify Different Systems",
+            type="primary"
+        ):
 
-                description = row.get(description_col, "")
+            records = []
+
+            # Use actual Excel row numbers, not DataFrame indexes
+            for row_num in range(header_row + 1, ws.max_row + 1):
+
+                values = [
+                    ws.cell(row=row_num, column=col).value
+                    for col in range(1, ws.max_column + 1)
+                ]
+
+                # Skip completely empty rows
+                if all(v is None for v in values):
+                    continue
+
+                description = ws.cell(
+                    row=row_num,
+                    column=description_col
+                ).value
 
                 part_code = (
-                    row.get(code_col, "")
-                    if code_col != "None"
-                    else ""
+                    ws.cell(row=row_num, column=code_col).value
+                    if code_col else ""
                 )
 
-                suggestions.append(
-                    identify_system(description, part_code)
+                suggestion = identify_system(
+                    description,
+                    part_code
                 )
 
-            st.session_state["boq_df"] = df.copy()
-            st.session_state["suggestions"] = suggestions
-            st.session_state["excel_content"] = file_content
-            st.session_state["selected_sheet"] = sheet_name
-            st.session_state["header_row"] = int(header_row)
+                records.append({
+                    "Excel Row": row_num,
+                    "Description": str(description or ""),
+                    "Suggested System": suggestion,
+                    "Final System": suggestion
+                })
 
-        if "boq_df" in st.session_state:
+            if not records:
+                st.warning("No BOQ items found below the header.")
+            else:
+                st.session_state["boq_records"] = pd.DataFrame(records)
+                st.session_state["source_bytes"] = original_bytes
+                st.session_state["source_sheet"] = sheet_name
+                st.session_state["source_header"] = header_row
+                st.session_state["source_filename"] = uploaded.name
+                st.session_state.pop("generated_files", None)
 
-            st.header("3. Review System Identification")
+                st.success(
+                    f"{len(records)} BOQ rows identified."
+                )
 
-            original_df = st.session_state["boq_df"]
+        if "boq_records" in st.session_state:
 
-            review_df = pd.DataFrame({
-                "Excel Row": [
-                    i + st.session_state["header_row"] + 1
-                    for i in range(len(original_df))
-                ],
-                "Description": original_df[description_col].astype(str),
-                "Suggested System": st.session_state["suggestions"],
-                "Final System": st.session_state["suggestions"]
-            })
+            st.header("4. Review System Identification")
 
             st.info(
-                "Review the suggested systems. Change incorrect "
-                "assignments manually before downloading."
+                "Check every suggestion. You can manually change "
+                "the Final System before generating files."
             )
 
-            edited_df = st.data_editor(
-                review_df,
+            edited = st.data_editor(
+                st.session_state["boq_records"],
                 use_container_width=True,
                 hide_index=True,
-                disabled=["Excel Row", "Description", "Suggested System"],
+                disabled=[
+                    "Excel Row",
+                    "Description",
+                    "Suggested System"
+                ],
                 column_config={
                     "Final System": st.column_config.SelectboxColumn(
                         "Final System",
@@ -223,112 +284,123 @@ if uploaded:
                         required=True
                     )
                 },
-                key="system_review"
+                key="review_editor"
             )
 
-            st.header("4. Generate Separate Excel Files")
+            st.session_state["boq_records"] = edited
 
-            if st.button("Generate System-wise BOQs", type="primary"):
+            st.write(
+                "Total items:",
+                len(edited)
+            )
 
-                grouped_systems = edited_df["Final System"].unique()
+            st.write(
+                "Unassigned items:",
+                len(
+                    edited[
+                        edited["Final System"] == "Unassigned"
+                    ]
+                )
+            )
+
+            st.header("5. Generate Separate Excel BOQs")
+
+            if st.button(
+                "Generate System-wise BOQs",
+                type="primary"
+            ):
+
+                generated_files = []
 
                 zip_buffer = BytesIO()
-                generated = []
 
-                with ZipFile(
-                    zip_buffer, "w", ZIP_DEFLATED
-                ) as zip_file:
+                systems_found = edited["Final System"].unique()
 
-                    for system in grouped_systems:
+                try:
+                    with ZipFile(
+                        zip_buffer,
+                        "w",
+                        ZIP_DEFLATED
+                    ) as zip_file:
 
-                        if system == "Unassigned":
-                            continue
+                        for system in systems_found:
 
-                        selected_rows = edited_df[
-                            edited_df["Final System"] == system
-                        ]["Excel Row"].tolist()
-
-                        # Load original workbook to preserve formatting
-                        wb = load_workbook(
-                            BytesIO(st.session_state["excel_content"])
-                        )
-
-                        ws = wb[st.session_state["selected_sheet"]]
-
-                        keep_rows = set(selected_rows)
-
-                        # Remove rows not belonging to this system
-                        # Process from bottom to top
-                        for r in range(ws.max_row, 0, -1):
-
-                            if r <= st.session_state["header_row"]:
+                            if system == "Unassigned":
                                 continue
 
-                            if r not in keep_rows:
-                                ws.delete_rows(r, 1)
+                            selected_rows = set(
+                                edited[
+                                    edited["Final System"] == system
+                                ]["Excel Row"].tolist()
+                            )
 
-                        output = excel_bytes(wb)
+                            if not selected_rows:
+                                continue
 
-                        safe_name = re.sub(
-                            r"[^A-Za-z0-9]+",
-                            "_",
-                            system
-                        )
+                            file_content = create_system_excel(
+                                st.session_state["source_bytes"],
+                                st.session_state["source_sheet"],
+                                st.session_state["source_header"],
+                                selected_rows
+                            )
 
-                        filename = safe_name + "_BOQ.xlsx"
+                            filename = (
+                                safe_filename(system)
+                                + "_BOQ.xlsx"
+                            )
 
-                        zip_file.writestr(
-                            filename,
-                            output.getvalue()
-                        )
+                            zip_file.writestr(
+                                filename,
+                                file_content
+                            )
 
-                        generated.append(
-                            (system, filename, output.getvalue())
-                        )
+                            generated_files.append({
+                                "system": system,
+                                "filename": filename,
+                                "content": file_content
+                            })
 
-                st.session_state["generated"] = generated
-                st.session_state["zip_data"] = zip_buffer.getvalue()
+                    st.session_state["generated_files"] = generated_files
+                    st.session_state["generated_zip"] = zip_buffer.getvalue()
 
-            if "generated" in st.session_state:
+                except Exception as error:
+                    st.error(
+                        f"Excel generation error: {error}"
+                    )
+
+            if "generated_files" in st.session_state:
+
+                files = st.session_state["generated_files"]
 
                 st.success(
-                    f"{len(st.session_state['generated'])} system files generated!"
+                    f"{len(files)} separate system files generated!"
                 )
 
-                for system, filename, content in st.session_state["generated"]:
+                for item in files:
 
                     st.download_button(
-                        label=f"Download {system} Excel",
-                        data=content,
-                        file_name=filename,
+                        label="Download " + item["system"],
+                        data=item["content"],
+                        file_name=item["filename"],
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="download_" + filename
+                        key="download_" + item["filename"]
                     )
 
                 st.download_button(
-                    "Download ALL Systems (ZIP)",
-                    data=st.session_state["zip_data"],
-                    file_name="MEP_All_System_BOQs.zip",
+                    label="Download ALL System BOQs (ZIP)",
+                    data=st.session_state["generated_zip"],
+                    file_name="MEP_System_Wise_BOQs.zip",
                     mime="application/zip",
                     type="primary"
                 )
 
-            unassigned = edited_df[
-                edited_df["Final System"] == "Unassigned"
-            ]
-
-            if len(unassigned) > 0:
-                st.warning(
-                    f"{len(unassigned)} rows are unassigned. "
-                    "Review these rows manually."
-                )
-
-    except Exception as e:
-        st.error(f"Error processing Excel: {e}")
-        st.info(
-            "Check the Excel file and selected worksheet. "
-            "For complex merged-cell templates, custom handling may be needed."
+    except Exception as error:
+        st.error(
+            f"Unable to process Excel: {error}"
         )
 
 st.divider()
-st.caption("MEP BOQ Automation | System Separation Version 1")
+
+st.caption(
+    "MEP BOQ Automation | System Separation Version 2"
+)
