@@ -135,23 +135,73 @@ def similarity(a,b):
     if a==b:return 1
     return SequenceMatcher(None,a,b).ratio()
 
-def client_items(ws,hr,headers):
-    dc=auto_col(headers,['description of item','item description','description','particulars','item details'])
-    sc=auto_col(headers,['technical specifications','specifications','specification'])
-    qc=auto_col(headers,['quantity','qty'])
-    uc=auto_col(headers,['unit','uom'])
-    cc=auto_col(headers,['part code','item code','product code','model no'])
-    if not dc:return [],{}
-    items=[]
-    for r in range(hr+1,ws.max_row+1):
-        d=clean(ws.cell(r,headers[dc]).value)
-        if not d or re.search(r'\b(total|summary|grand total)\b',d,re.I):continue
-        q=ws.cell(r,headers[qc]).value if qc else None
-        code=clean(ws.cell(r,headers[cc]).value) if cc else ''
-        serial=clean(ws.cell(r,1).value)
-        if q is None and not code and not re.match(r'^\d+(\.\d+)?$',serial):continue
-        items.append({'Client Row':r,'Client Description':d,'Client Specification':clean(ws.cell(r,headers[sc]).value) if sc else '', 'Client Code':code,'Client Qty':q,'Client Unit':clean(ws.cell(r,headers[uc]).value) if uc else ''})
-    return items,{'desc':headers[dc],'spec':headers.get(sc) if sc else None,'qty':headers.get(qc) if qc else None,'unit':headers.get(uc) if uc else None,'code':headers.get(cc) if cc else None}
+def client_items(ws, hr, headers):
+    """ Robust client BOQ row detection. Works even when the blank template has no Supply/Installation headings. Returns real Excel row numbers and a mapping of detected columns. """
+    def find_col(patterns):
+        scored = []
+        for label, col_num in headers.items():
+            raw_header = clean(ws.cell(hr, col_num).value)
+            n = norm(raw_header)
+            for pat in patterns:
+                pn = norm(pat)
+                if pn and (n == pn or pn in n):
+                    scored.append((len(pn), col_num))
+        return max(scored)[1] if scored else None
+
+    desc_col = find_col([
+        'description of item', 'item description', 'description',
+        'particulars', 'item details', 'material description'
+    ])
+    spec_col = find_col(['key technical specifications', 'technical specifications',
+                         'specifications', 'specification'])
+    qty_col = find_col(['quantity', 'qty'])
+    unit_col = find_col(['unit', 'uom'])
+    code_col = find_col(['part code', 'item code', 'product code', 'model no'])
+
+    if desc_col is None:
+        return [], {}
+
+    items = []
+    for r in range(hr + 1, ws.max_row + 1):
+        desc = clean(ws.cell(r, desc_col).value)
+        if not desc:
+            continue
+        nd = norm(desc)
+        if nd in {'description', 'description of item', 'item description',
+                  'total', 'grand total', 'sub total', 'subtotal'}:
+            continue
+        if re.search(r'\b(grand total|sub\s*total|system total|total amount)\b', desc, re.I):
+            continue
+
+        qty_val = ws.cell(r, qty_col).value if qty_col else None
+        unit_val = clean(ws.cell(r, unit_col).value) if unit_col else ''
+        code_val = clean(ws.cell(r, code_col).value) if code_col else ''
+        serial_val = ws.cell(r, 1).value
+
+        # Keep a row if it has a numeric serial, a quantity, a part code,
+        # or both a unit and a technical specification.
+        serial_is_numeric = isinstance(serial_val, (int, float)) or bool(
+            re.fullmatch(r'\d+(?:\.\d+)?', clean(serial_val))
+        )
+        qty_present = qty_val is not None and clean(qty_val) != ''
+        spec_present = bool(clean(ws.cell(r, spec_col).value)) if spec_col else False
+
+        if not (serial_is_numeric or qty_present or code_val or (unit_val and spec_present)):
+            continue
+
+        items.append({
+            'Client Row': r,
+            'Client Description': desc,
+            'Client Specification': clean(ws.cell(r, spec_col).value) if spec_col else '',
+            'Client Code': code_val,
+            'Client Qty': qty_val,
+            'Client Unit': unit_val
+        })
+
+    return items, {
+        'desc': desc_col, 'spec': spec_col, 'qty': qty_col,
+        'unit': unit_col, 'code': code_col
+    }
 
 def compare(client,oem):
     odf=pd.DataFrame(oem); used=set(); results=[]
@@ -220,7 +270,7 @@ with tab_rates:
         # auto-detect client header among first 20 rows
         candidates=[]
         for rr in range(1,min(cws.max_row,20)+1):
-            hm0=header_map(cws,rr); score=sum(any(k in norm(x) for k in ['description','qty','quantity','unit','rate']) for x in hm0)
+            hm0=header_map(cws,rr); score=(5 if any('description' in norm(x) for x in hm0) else 0) + (2 if any(norm(x).endswith('qty') or 'quantity' in norm(x) for x in hm0) else 0) + (1 if any(norm(x).endswith('unit') or 'uom' in norm(x) for x in hm0) else 0)
             candidates.append((score,rr,hm0))
         _,chr0,chm=max(candidates,key=lambda x:x[0]) if candidates else (0,1,{})
         chr1=int(st.number_input('Client header row (auto-detected; change only if needed)',1,max(1,cws.max_row),int(chr0 or 1),key='multi_chr'))
@@ -274,13 +324,32 @@ with tab_rates:
                 # choose one OEM for final rate fill, preserving the comparison of all suppliers
                 supplier=st.selectbox('Select OEM whose approved rates should be applied',comp['OEM Supplier File'].dropna().unique(),key='final_supplier')
                 if st.button('Apply approved rates and create final client BOQ',type='primary',key='multi_apply'):
-                    out=load_workbook(BytesIO(st.session_state['multi_client_bytes'])); ws=out[st.session_state['multi_client_sheet']]; hdr=st.session_state['multi_client_header']; hm=header_map(ws,hdr); cols=st.session_state['multi_client_cols']
-                    supply_col=auto_col(hm,['supply rate','unit supply rate','basic rate','supply amount'])
-                    install_col=auto_col(hm,['installation rate','install rate','installation amount'])
-                    make_col=auto_col(hm,['make','brand','manufacturer'])
-                    qty_col=cols.get('qty')
-                    total_supply=auto_col(hm,['total supply amount','total supply amt','supply total'])
-                    total_install=auto_col(hm,['total installation amount','total installation amt','installation total'])
+                    out=load_workbook(BytesIO(st.session_state['multi_client_bytes'])); ws=out[st.session_state['multi_client_sheet']]; hdr=st.session_state['multi_client_header']; cols=st.session_state['multi_client_cols']
+                    # Restore headings in intentionally blank rate columns (common in blank client templates).
+                    existing = {norm(ws.cell(hdr, c).value): c for c in range(1, ws.max_column + 1) if clean(ws.cell(hdr, c).value)}
+                    def ensure_header(name, preferred_col=None):
+                        key = norm(name)
+                        if key in existing: return existing[key]
+                        if preferred_col and preferred_col <= ws.max_column and not clean(ws.cell(hdr, preferred_col).value):
+                            ws.cell(hdr, preferred_col).value = name
+                            existing[key] = preferred_col
+                            return preferred_col
+                        new_col = ws.max_column + 1
+                        ws.cell(hdr, new_col).value = name
+                        existing[key] = new_col
+                        return new_col
+                    # Preserve the familiar client BOQ layout when F:J are blank.
+                    supply_col = next((c for c in range(1, ws.max_column+1) if 'supply rate' in norm(ws.cell(hdr,c).value)), None)
+                    install_col = next((c for c in range(1, ws.max_column+1) if 'installation rate' in norm(ws.cell(hdr,c).value)), None)
+                    total_supply = next((c for c in range(1, ws.max_column+1) if 'total supply' in norm(ws.cell(hdr,c).value)), None)
+                    total_install = next((c for c in range(1, ws.max_column+1) if 'total installation' in norm(ws.cell(hdr,c).value)), None)
+                    make_col = next((c for c in range(1, ws.max_column+1) if norm(ws.cell(hdr,c).value) in ('make','makes offered','brand','manufacturer')), None)
+                    if supply_col is None: supply_col = ensure_header('Supply Rate', 6)
+                    if total_supply is None: total_supply = ensure_header('Total Supply Amt', 7)
+                    if install_col is None: install_col = ensure_header('Installation Rate', 8)
+                    if total_install is None: total_install = ensure_header('Total Installation Amt', 9)
+                    if make_col is None: make_col = ensure_header('Makes Offered', 10)
+                    qty_col = cols.get('qty')
                     chosen=comp[(comp['OEM Supplier File']==supplier)&(comp['Approved'].fillna(False))]
                     if not supply_col and not install_col:st.error('Client BOQ supply/installation rate columns could not be detected. Add those column headings to the client template and retry.')
                     else:
