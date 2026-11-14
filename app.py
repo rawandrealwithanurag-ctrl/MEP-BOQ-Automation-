@@ -287,4 +287,26 @@ with tab_rates:
                         for _,r in chosen.iterrows():
                             rr=int(r['Client Row'])
                             if supply_col and pd.notna(r.get('Supply Rate')):ws.cell(rr,supply_col).value=float(r['Supply Rate'])
-                            if install_col and pd.notna(r.get('Installatio
+                            if install_col and pd.notna(r.get('Installation Rate')):ws.cell(rr,install_col).value=float(r['Installation Rate'])
+                            if make_col and clean(r.get('Make')):ws.cell(rr,make_col).value=clean(r['Make'])
+                            if qty_col and total_supply and supply_col and pd.notna(r.get('Supply Rate')):ws.cell(rr,total_supply).value=f'={get_column_letter(supply_col)}{rr}*{get_column_letter(qty_col)}{rr}'
+                            if qty_col and total_install and install_col and pd.notna(r.get('Installation Rate')):ws.cell(rr,total_install).value=f'={get_column_letter(install_col)}{rr}*{get_column_letter(qty_col)}{rr}'
+                        if 'BOQ Comparison' in out.sheetnames:del out['BOQ Comparison']
+                        cw=out.create_sheet('BOQ Comparison');cw.append(['OEM Supplier File','Client Row','Client Description','Client Qty','Client Unit','OEM Description','Match Score %','Status','Supply Rate','Installation Rate','Make','Approved'])
+                        for _,r in comp.iterrows():cw.append([r.get('OEM Supplier File'),r.get('Client Row'),r.get('Client Description'),r.get('Client Qty'),r.get('Client Unit'),r.get('OEM Description'),r.get('Match Score %'),r.get('Status'),r.get('Supply Rate'),r.get('Installation Rate'),r.get('Make'),bool(r.get('Approved',False))])
+                        cw.append([]);cw.append(['Extra items found in OEM files'])
+                        for col in extra.columns.tolist(): pass
+                        if not extra.empty:
+                            cw.append(list(extra.columns))
+                            for _,r in extra.iterrows():cw.append([r.get(k) for k in extra.columns])
+                        style_sheet(cw)
+                        for col in cw.columns:
+                            letter=get_column_letter(col[0].column);cw.column_dimensions[letter].width=min(55,max(14,max((len(clean(x.value)) for x in col if x.value is not None),default=10)+2))
+                        out.calculation.fullCalcOnLoad=True;out.calculation.forceFullCalc=True
+                        buf=BytesIO();out.save(buf);st.success(f'Final BOQ created using {supplier}. Review the BOQ Comparison sheet before issuing.')
+                        st.download_button('Download Final Client BOQ + Comparison',buf.getvalue(),'Final_Client_BOQ_with_Multi_OEM_Comparison.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',type='primary')
+        elif ofs and not items:st.info('First confirm that client item rows are detected.')
+    else:st.caption('Upload the client blank BOQ to begin. Then upload multiple OEM files together.')
+
+st.divider()
+st.caption('MEP BOQ Automation | Automatic detection is a first pass. Verify OCR, matches, rates and missing/extra items before issue.')
